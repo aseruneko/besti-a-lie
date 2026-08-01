@@ -1,0 +1,27 @@
+{
+  "tasks": {
+    "dev": "deno run -A --env-file --watch=static/,routes/,islands/ dev.ts",
+    "start": "deno run -A --env-file main.ts",
+    "manifest": "deno run -A --env-file dev.ts --manifest",
+    "build": "deno run -A dev.ts build",
+    "check": "deno fmt --check . && deno lint && deno check **/*.ts **/*.tsx"
+  },
+  "imports": {
+    "$fresh/": "https://deno.land/x/fresh@1.7.3/",
+    "@preact/signals": "https://esm.sh/*@preact/signals@1.2.2",
+    "@preact/signals-core": "https://esm.sh/*@preact/signals-core@1.5.1",
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4?target=es2022",
+    "preact": "https://esm.sh/preact@10.22.0",
+    "preact/": "https://esm.sh/preact@10.22.0/"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact"
+  },
+  "fmt": {
+    "exclude": ["_fresh"]
+  },
+  "lint": {
+    "exclude": ["_fresh"]
+  }
+}
