@@ -1,1 +1,13 @@
 .env
+.env.*
+!.env.example
+
+_fresh/
+.deno/
+node_modules/
+coverage/
+
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

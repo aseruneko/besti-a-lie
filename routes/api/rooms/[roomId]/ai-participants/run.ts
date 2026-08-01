@@ -2,6 +2,7 @@ import type { Handlers } from "$fresh/server.ts";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 type AiPersonality = "normal" | "weird" | "formal" | "archaic" | "technical";
+type PromptMode = "normal" | "freeform";
 
 type Member = {
   aiParticipantId?: string | null;
@@ -15,12 +16,14 @@ type GameState = {
     currentPhase:
       | "waiting"
       | "prompt"
+      | "checking"
       | "writing"
       | "editing"
       | "voting"
       | "results";
   };
   prompt: {
+    mode?: PromptMode;
     word: string;
   } | null;
   members: Member[];
@@ -62,6 +65,29 @@ const personalityPrompts: Record<AiPersonality, PersonalityPrompt> = {
   technical: {
     label: "専門用語AI",
     direction: "学術用語や専門分野の語義に見える説明にしてください。",
+  },
+};
+
+const freeformPersonalityPrompts: Record<AiPersonality, PersonalityPrompt> = {
+  normal: {
+    label: "ふつうAI",
+    direction: "自然な雑学回答らしく、短くもっともらしく書いてください。",
+  },
+  weird: {
+    label: "へんなAI",
+    direction: "少し意外な因果や偶然を含めつつ、ありそうな回答にしてください。",
+  },
+  formal: {
+    label: "硬派な辞書AI",
+    direction: "百科事典や解説文のような落ち着いた文体にしてください。",
+  },
+  archaic: {
+    label: "古語っぽいAI",
+    direction: "古い記録や逸話にありそうな雰囲気を少し含めてください。",
+  },
+  technical: {
+    label: "専門用語AI",
+    direction: "専門分野の知見に見える説明にしてください。",
   },
 };
 
@@ -158,14 +184,58 @@ function extractOpenAiErrorMessage(errorBody: string) {
   return errorBody.trim().slice(0, 500);
 }
 
+function getAiDefinitionPrompt(
+  mode: PromptMode,
+  aiParticipant: AiParticipantRow,
+) {
+  if (mode === "freeform") {
+    const personality = freeformPersonalityPrompts[aiParticipant.personality] ??
+      freeformPersonalityPrompts.normal;
+    return {
+      instructions: [
+        "あなたは『自由律たほいや』に参加するAI回答者です。",
+        "与えられたお題について、正解ではない架空の回答を1件だけ作ってください。",
+        "正解は渡されていません。実在しそうなエピソード、雑学、事実のように書いてください。",
+        "プレイヤーが正解と迷うように、具体性を少し入れてください。",
+        "本文だけを出力してください。見出し、箇条書き、引用符、説明は不要です。",
+        "120文字以内の短い1文で出力してください。",
+        `あなたの個性: ${personality.label}`,
+        personality.direction,
+      ].join("\n"),
+      inputLabel: "お題",
+      existingLabel: "このリクエスト内ですでに生成済みの架空回答:",
+    };
+  }
+
+  const personality = personalityPrompts[aiParticipant.personality] ??
+    personalityPrompts.normal;
+  return {
+    instructions: [
+      "あなたは『たほいや』に参加するAI回答者です。",
+      "与えられたお題語について、正解ではない偽の意味を1件だけ作ってください。",
+      "ただし、プレイヤーが正解と迷うように、実在語義らしい辞書調で書いてください。",
+      "正しい意味を知っているふりをして断定しすぎず、もっともらしい別語義にしてください。",
+      "本文だけを出力してください。見出し、箇条書き、引用符、説明は不要です。",
+      "80文字以内の短い1文で出力してください。",
+      `あなたの個性: ${personality.label}`,
+      personality.direction,
+    ].join("\n"),
+    inputLabel: "お題語",
+    existingLabel: "このリクエスト内ですでに生成済みの偽意味:",
+  };
+}
+
 async function createAiDefinition(
   openAiKey: string,
   word: string,
+  mode: PromptMode,
   aiParticipant: AiParticipantRow,
   generatedDefinitions: string[],
 ) {
-  const personality = personalityPrompts[aiParticipant.personality] ??
-    personalityPrompts.normal;
+  const prompt = getAiDefinitionPrompt(
+    mode,
+    aiParticipant,
+  );
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -174,20 +244,11 @@ async function createAiDefinition(
     },
     body: JSON.stringify({
       model: Deno.env.get("OPENAI_MODEL") ?? "gpt-5",
-      instructions: [
-        "あなたは『たほいや』に参加するAI回答者です。",
-        "与えられたお題語について、正解ではない偽の意味を1件だけ作ってください。",
-        "ただし、プレイヤーが正解と迷うように、実在語義らしい辞書調で書いてください。",
-        "正しい意味を知っているふりをして断定しすぎず、もっともらしい別語義にしてください。",
-        "本文だけを出力してください。見出し、箇条書き、引用符、説明は不要です。",
-        "80文字以内の短い1文で出力してください。",
-        `あなたの個性: ${personality.label}`,
-        personality.direction,
-      ].join("\n"),
+      instructions: prompt.instructions,
       input: [
-        `お題語: ${word}`,
+        `${prompt.inputLabel}: ${word}`,
         `AI枠: ${aiParticipant.slot}`,
-        "このリクエスト内ですでに生成済みの偽意味:",
+        prompt.existingLabel,
         generatedDefinitions.length > 0
           ? generatedDefinitions.join("\n")
           : "なし",
@@ -226,6 +287,7 @@ async function createAiDefinition(
 async function createAiDefinitionWithRetries(
   openAiKey: string,
   word: string,
+  mode: PromptMode,
   aiParticipant: AiParticipantRow,
   generatedDefinitions: string[],
 ) {
@@ -236,6 +298,7 @@ async function createAiDefinitionWithRetries(
       return await createAiDefinition(
         openAiKey,
         word,
+        mode,
         aiParticipant,
         generatedDefinitions,
       );
@@ -333,6 +396,7 @@ export const handler: Handlers = {
       const body = await createAiDefinitionWithRetries(
         openAiKey,
         gameState.prompt.word,
+        gameState.prompt.mode ?? "normal",
         aiParticipant,
         generatedDefinitions,
       );

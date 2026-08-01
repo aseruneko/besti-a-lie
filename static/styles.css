@@ -300,6 +300,30 @@ button:disabled {
   margin-top: 18px;
 }
 
+.action-row {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.mode-toggle {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 16px;
+}
+
+.mode-toggle button {
+  margin-top: 0;
+}
+
+.selected-button {
+  background: rgb(40 111 108 / 12%);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
 .joined-rooms-block {
   border-top: 1px solid var(--line);
   margin-top: 20px;
@@ -547,6 +571,7 @@ button:disabled {
   }
 
   .share-row,
+  .action-row,
   .choice-option,
   .score-row {
     grid-template-columns: 1fr;

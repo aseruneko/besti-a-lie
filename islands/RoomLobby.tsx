@@ -24,6 +24,7 @@ type ViewState =
 type RoomPhase =
   | "waiting"
   | "prompt"
+  | "checking"
   | "writing"
   | "editing"
   | "voting"
@@ -50,7 +51,10 @@ type Member = {
   hasVoted: boolean;
 };
 
+type PromptMode = "normal" | "freeform";
+
 type PromptState = {
+  mode?: PromptMode;
   word: string;
   correctDefinition?: string;
 };
@@ -90,16 +94,32 @@ type Score = {
   totalPoints: number;
 };
 
+type KnowledgeCheck = {
+  userId: string;
+  username: string;
+  knowsWord: boolean | null;
+  hasAnswered: boolean;
+};
+
+type RoundSummary = {
+  roundNumber: number;
+  word: string;
+  winners: string[];
+  topPoints: number;
+};
+
 type GameState = {
   room: RoomState;
   members: Member[];
   prompt: PromptState | null;
   ownDefinition: OwnDefinition | null;
   draftDefinitions: DraftDefinition[];
+  knowledgeChecks: KnowledgeCheck[];
   choices: Choice[];
   ownVoteChoiceId: string | null;
   results: ResultChoice[];
   scores: Score[];
+  roundSummaries: RoundSummary[];
 };
 
 type EditChoice = {
@@ -126,6 +146,51 @@ const aiPersonalityOptions: { value: AiPersonality; label: string }[] = [
   { value: "technical", label: "それっぽい専門用語" },
 ];
 
+const promptModeOptions: { value: PromptMode; label: string }[] = [
+  { value: "normal", label: "ノーマル" },
+  { value: "freeform", label: "自由律" },
+];
+
+function getPromptModeLabels(mode: PromptMode) {
+  if (mode === "freeform") {
+    return {
+      modeName: "自由律",
+      wordLabel: "お題",
+      wordPlaceholder: "例: 後藤象二郎、大山巌、西園寺公望の意外なエピソード",
+      correctLabel: "正解",
+      correctPlaceholder: "明確な正解がある事実やエピソード",
+      fakeLabel: "もっともらしい架空回答",
+      fakePlaceholder: "ありそうだけど正解ではないエピソードや事実を書く",
+      submitDefinition: "回答を提出する",
+      resubmitDefinition: "回答を再提出する",
+      allSubmitted: "全員の回答が揃いました。整形画面に進みます。",
+      aiWriting: "AI参加者が回答を書いています。",
+      knowledgeQuestion: "この答えを知っていますか？",
+      knownCountLabel: "答えを知っている",
+      voteInstruction: "正解だと思う回答を1つ選びます。",
+      correctResultLabel: "正解",
+    };
+  }
+
+  return {
+    modeName: "ノーマル",
+    wordLabel: "お題（読み）",
+    wordPlaceholder: "例: しるべ",
+    correctLabel: "正しい意味",
+    correctPlaceholder: "辞書に載っている本当の意味",
+    fakeLabel: "もっともらしい偽の意味",
+    fakePlaceholder: "正解っぽく、でも嘘の意味を書く",
+    submitDefinition: "意味を提出する",
+    resubmitDefinition: "意味を再提出する",
+    allSubmitted: "全員の意味が揃いました。整形画面に進みます。",
+    aiWriting: "AI参加者が意味を書いています。",
+    knowledgeQuestion: "このお題を知っていますか？",
+    knownCountLabel: "知っている",
+    voteInstruction: "正しいと思う意味を1つ選びます。",
+    correctResultLabel: "正しい意味",
+  };
+}
+
 function makeClient(
   supabaseUrl: string,
   supabaseAnonKey: string,
@@ -144,6 +209,7 @@ function makeClient(
 function phaseLabel(phase: RoomPhase) {
   if (phase === "waiting") return "待合";
   if (phase === "prompt") return "出題";
+  if (phase === "checking") return "既知確認";
   if (phase === "writing") return "意味提出";
   if (phase === "editing") return "整形";
   if (phase === "voting") return "投票";
@@ -152,6 +218,15 @@ function phaseLabel(phase: RoomPhase) {
 
 function makeEditKey(prefix: string, value: string) {
   return `${prefix}:${value}`;
+}
+
+function shuffleChoices(choices: EditChoice[]) {
+  const next = [...choices];
+  for (let index = next.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
+  }
+  return next;
 }
 
 export default function RoomLobby(
@@ -163,8 +238,10 @@ export default function RoomLobby(
   const [user, setUser] = useState<User | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [message, setMessage] = useState("");
+  const [promptModeInput, setPromptModeInput] = useState<PromptMode>("normal");
   const [wordInput, setWordInput] = useState("");
   const [correctInput, setCorrectInput] = useState("");
+  const [inputLoadedRound, setInputLoadedRound] = useState(0);
   const [definitionInput, setDefinitionInput] = useState("");
   const [includeMasterInput, setIncludeMasterInput] = useState(false);
   const [aiParticipantCountInput, setAiParticipantCountInput] = useState(0);
@@ -196,6 +273,19 @@ export default function RoomLobby(
   );
   const pendingVoters = members.filter((member) =>
     member.isVoter && !member.hasVoted
+  );
+  const activePromptMode = gameState?.prompt?.mode ?? promptModeInput;
+  const inputLabels = getPromptModeLabels(promptModeInput);
+  const activeLabels = getPromptModeLabels(activePromptMode);
+  const knowledgeChecks = gameState?.knowledgeChecks ?? [];
+  const roundSummaries = gameState?.roundSummaries ?? [];
+  const ownKnowledgeCheck = user
+    ? knowledgeChecks.find((check) => check.userId === user.id) ?? null
+    : null;
+  const knownWordCount =
+    knowledgeChecks.filter((check) => check.knowsWord === true).length;
+  const pendingKnowledgeChecks = knowledgeChecks.filter((check) =>
+    !check.hasAnswered
   );
   const pendingAiMembers = pendingWriters.filter((member) => member.isAi);
   const aiWritingRunKey = room && pendingAiMembers.length > 0
@@ -241,14 +331,33 @@ export default function RoomLobby(
 
     if (aiRowsError) setMessage(aiRowsError.message);
 
+    const isNewLoadedRound = inputLoadedRound !== nextState.room.currentRound;
+
     setGameState(nextState);
     setAiParticipants(aiRows ?? []);
     setAiParticipantCountInput(aiRows?.length ?? 0);
     setIncludeMasterInput(nextState.room.includeMasterAsPlayer);
-    setWordInput(nextState.prompt?.word ?? wordInput);
-    setCorrectInput(nextState.prompt?.correctDefinition ?? correctInput);
-    setDefinitionInput(nextState.ownDefinition?.body ?? definitionInput);
-    setVoteChoiceId(nextState.ownVoteChoiceId ?? voteChoiceId);
+    if (nextState.prompt) {
+      setPromptModeInput(nextState.prompt.mode ?? "normal");
+      setWordInput(nextState.prompt.word);
+      setCorrectInput(nextState.prompt.correctDefinition ?? correctInput);
+      setInputLoadedRound(nextState.room.currentRound);
+    } else if (inputLoadedRound !== nextState.room.currentRound) {
+      setPromptModeInput("normal");
+      setWordInput("");
+      setCorrectInput("");
+      setInputLoadedRound(nextState.room.currentRound);
+    }
+    if (nextState.ownDefinition) {
+      setDefinitionInput(nextState.ownDefinition.body);
+    } else if (isNewLoadedRound) {
+      setDefinitionInput("");
+    }
+    if (nextState.ownVoteChoiceId) {
+      setVoteChoiceId(nextState.ownVoteChoiceId);
+    } else if (isNewLoadedRound) {
+      setVoteChoiceId("");
+    }
     setViewState("ready");
   }
 
@@ -343,6 +452,15 @@ export default function RoomLobby(
         {
           event: "*",
           schema: "public",
+          table: "prompt_knowledge_checks",
+        },
+        reload,
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
           table: "definitions",
           filter: `room_id=eq.${roomId}`,
         },
@@ -406,7 +524,7 @@ export default function RoomLobby(
 
     if (nextKey === editLoadedKey) return;
 
-    setEditChoices([
+    setEditChoices(shuffleChoices([
       {
         key: "correct",
         sourceDefinitionId: null,
@@ -419,7 +537,7 @@ export default function RoomLobby(
         isCorrect: false,
         body: definition.body,
       })),
-    ]);
+    ]));
     setEditLoadedKey(nextKey);
   }, [gameState, isOwner, editLoadedKey]);
 
@@ -521,7 +639,9 @@ export default function RoomLobby(
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
+          "content-type": "application/json",
         },
+        body: JSON.stringify({ mode: promptModeInput }),
       },
     );
     const responseText = await response.text();
@@ -555,6 +675,62 @@ export default function RoomLobby(
       target_room_id: roomId,
       next_word: wordInput,
       next_correct_definition: correctInput,
+      next_mode: promptModeInput,
+    });
+
+    if (error) {
+      setMessage(error.message);
+      setViewState("ready");
+      return;
+    }
+
+    await loadGameState(supabase);
+  }
+
+  async function handleSubmitKnowledge(knowsWord: boolean) {
+    if (!supabase) return;
+
+    setMessage("");
+    setViewState("saving");
+    const { error } = await supabase.rpc("submit_prompt_knowledge", {
+      target_room_id: roomId,
+      next_knows_word: knowsWord,
+    });
+
+    if (error) {
+      setMessage(error.message);
+      setViewState("ready");
+      return;
+    }
+
+    await loadGameState(supabase);
+  }
+
+  async function handleContinueAfterCheck() {
+    if (!supabase) return;
+
+    setMessage("");
+    setViewState("saving");
+    const { error } = await supabase.rpc("continue_prompt_after_check", {
+      target_room_id: roomId,
+    });
+
+    if (error) {
+      setMessage(error.message);
+      setViewState("ready");
+      return;
+    }
+
+    await loadGameState(supabase);
+  }
+
+  async function handleCancelAfterCheck() {
+    if (!supabase) return;
+
+    setMessage("");
+    setViewState("saving");
+    const { error } = await supabase.rpc("cancel_prompt_after_check", {
+      target_room_id: roomId,
     });
 
     if (error) {
@@ -692,6 +868,26 @@ export default function RoomLobby(
     await loadGameState(supabase);
   }
 
+  async function handleStartNextRound() {
+    if (!supabase) return;
+
+    setMessage("");
+    setViewState("saving");
+    const { error } = await supabase.rpc("start_next_round", {
+      target_room_id: roomId,
+    });
+
+    if (error) {
+      setMessage(error.message);
+      setViewState("ready");
+      return;
+    }
+
+    setEditChoices([]);
+    setEditLoadedKey("");
+    await loadGameState(supabase);
+  }
+
   function moveEditChoice(index: number, direction: -1 | 1) {
     setEditChoices((current) => {
       const nextIndex = index + direction;
@@ -759,7 +955,10 @@ export default function RoomLobby(
 
       {room.currentPhase === "waiting" && (
         <section class="phase-block">
-          <p class="muted">参加者が揃ったら、お題と正しい意味を入力します。</p>
+          <p class="muted">
+            第{room
+              .currentRound}ラウンドです。参加者が揃ったら、お題と正しい意味を入力します。
+          </p>
 
           {isOwner && (
             <>
@@ -868,6 +1067,22 @@ export default function RoomLobby(
               )}
 
               <form class="writing-form" onSubmit={handleStartPrompt}>
+                <label class="field-label">モード</label>
+                <div class="mode-toggle" role="group" aria-label="モード">
+                  {promptModeOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      class={promptModeInput === option.value
+                        ? "secondary-button selected-button"
+                        : "secondary-button"}
+                      disabled={viewState === "saving"}
+                      onClick={() => setPromptModeInput(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
                 <button
                   type="button"
                   class="secondary-button"
@@ -879,7 +1094,7 @@ export default function RoomLobby(
                     : "AIにお題を作ってもらう"}
                 </button>
                 <label class="field-label" htmlFor="word-input">
-                  お題
+                  {inputLabels.wordLabel}
                 </label>
                 <input
                   id="word-input"
@@ -890,10 +1105,10 @@ export default function RoomLobby(
                     setWordInput(
                       (event.currentTarget as HTMLInputElement).value,
                     )}
-                  placeholder="例: しるべ"
+                  placeholder={inputLabels.wordPlaceholder}
                 />
                 <label class="field-label setting-label" htmlFor="correct">
-                  正しい意味
+                  {inputLabels.correctLabel}
                 </label>
                 <textarea
                   id="correct"
@@ -904,10 +1119,10 @@ export default function RoomLobby(
                     setCorrectInput(
                       (event.currentTarget as HTMLTextAreaElement).value,
                     )}
-                  placeholder="辞書に載っている本当の意味"
+                  placeholder={inputLabels.correctPlaceholder}
                 />
                 <button type="submit" disabled={viewState === "saving"}>
-                  意味提出を開始する
+                  お題を確認に出す
                 </button>
               </form>
             </>
@@ -918,6 +1133,179 @@ export default function RoomLobby(
               ルームマスターがお題を決めるまで待機しています。
             </p>
           )}
+        </section>
+      )}
+
+      {room.currentPhase === "prompt" && (
+        <section class="phase-block">
+          {isOwner
+            ? (
+              <form class="writing-form" onSubmit={handleStartPrompt}>
+                <p class="muted">
+                  お題を編集して、参加者が知っているかもう一度確認します。
+                </p>
+                <label class="field-label">モード</label>
+                <div class="mode-toggle" role="group" aria-label="モード">
+                  {promptModeOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      class={promptModeInput === option.value
+                        ? "secondary-button selected-button"
+                        : "secondary-button"}
+                      disabled={viewState === "saving"}
+                      onClick={() => setPromptModeInput(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  class="secondary-button"
+                  disabled={viewState === "saving" || promptGenerating}
+                  onClick={handleGeneratePrompt}
+                >
+                  {promptGenerating
+                    ? "AIがお題を考えています"
+                    : "AIにお題を作ってもらう"}
+                </button>
+                <label class="field-label" htmlFor="word-input-retry">
+                  {inputLabels.wordLabel}
+                </label>
+                <input
+                  id="word-input-retry"
+                  maxLength={80}
+                  value={wordInput}
+                  disabled={viewState === "saving"}
+                  onInput={(event) =>
+                    setWordInput(
+                      (event.currentTarget as HTMLInputElement).value,
+                    )}
+                  placeholder={inputLabels.wordPlaceholder}
+                />
+                <label
+                  class="field-label setting-label"
+                  htmlFor="correct-retry"
+                >
+                  {inputLabels.correctLabel}
+                </label>
+                <textarea
+                  id="correct-retry"
+                  maxLength={1200}
+                  value={correctInput}
+                  disabled={viewState === "saving"}
+                  onInput={(event) =>
+                    setCorrectInput(
+                      (event.currentTarget as HTMLTextAreaElement).value,
+                    )}
+                  placeholder={inputLabels.correctPlaceholder}
+                />
+                <button type="submit" disabled={viewState === "saving"}>
+                  お題を確認に出す
+                </button>
+              </form>
+            )
+            : (
+              <p class="muted">
+                ルームマスターが次のお題を選び直しています。
+              </p>
+            )}
+        </section>
+      )}
+
+      {room.currentPhase === "checking" && (
+        <section class="phase-block">
+          <div class="prompt-panel">
+            <p class="status-label">{activeLabels.knowledgeQuestion}</p>
+            <strong>{gameState.prompt?.word}</strong>
+          </div>
+
+          {isOwner
+            ? (
+              <>
+                <p class="muted">
+                  知っている参加者がいる場合は、出題入力に戻って別のお題を選べます。
+                </p>
+                <div class="score-board">
+                  <p class="status-label">
+                    {activeLabels.knownCountLabel} {knownWordCount}人 / 未回答
+                    {" "}
+                    {pendingKnowledgeChecks.length}人
+                  </p>
+                  {knowledgeChecks.length === 0
+                    ? (
+                      <p class="muted">
+                        確認対象の人間参加者はいません。このまま開始できます。
+                      </p>
+                    )
+                    : knowledgeChecks.map((check) => (
+                      <div class="score-row" key={check.userId}>
+                        <span>{check.username}</span>
+                        <small>
+                          {!check.hasAnswered
+                            ? "未回答"
+                            : check.knowsWord
+                            ? "知ってる"
+                            : "知らない"}
+                        </small>
+                      </div>
+                    ))}
+                </div>
+                <div class="action-row">
+                  <button
+                    type="button"
+                    disabled={viewState === "saving"}
+                    onClick={handleContinueAfterCheck}
+                  >
+                    このまま開始
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    disabled={viewState === "saving"}
+                    onClick={handleCancelAfterCheck}
+                  >
+                    出題入力に戻る
+                  </button>
+                </div>
+              </>
+            )
+            : ownKnowledgeCheck
+            ? (
+              <div class="choice-list">
+                <button
+                  type="button"
+                  class={ownKnowledgeCheck.knowsWord === true
+                    ? "secondary-button selected-button"
+                    : "secondary-button"}
+                  disabled={viewState === "saving"}
+                  onClick={() => handleSubmitKnowledge(true)}
+                >
+                  知ってる
+                </button>
+                <button
+                  type="button"
+                  class={ownKnowledgeCheck.knowsWord === false
+                    ? "secondary-button selected-button"
+                    : "secondary-button"}
+                  disabled={viewState === "saving"}
+                  onClick={() => handleSubmitKnowledge(false)}
+                >
+                  知らない
+                </button>
+                {ownKnowledgeCheck.hasAnswered && (
+                  <p class="muted">
+                    回答済みです。ルームマスターの判断を待っています。
+                  </p>
+                )}
+              </div>
+            )
+            : (
+              <p class="muted">
+                今回あなたは確認対象外です。ルームマスターの判断を待っています。
+              </p>
+            )}
         </section>
       )}
 
@@ -932,7 +1320,7 @@ export default function RoomLobby(
             ? (
               <form class="writing-form" onSubmit={handleSubmitDefinition}>
                 <label class="field-label" htmlFor="definition">
-                  もっともらしい偽の意味
+                  {activeLabels.fakeLabel}
                 </label>
                 <textarea
                   id="definition"
@@ -943,12 +1331,12 @@ export default function RoomLobby(
                     setDefinitionInput(
                       (event.currentTarget as HTMLTextAreaElement).value,
                     )}
-                  placeholder="正解っぽく、でも嘘の意味を書く"
+                  placeholder={activeLabels.fakePlaceholder}
                 />
                 <button type="submit" disabled={viewState === "saving"}>
                   {gameState.ownDefinition
-                    ? "意味を再提出する"
-                    : "意味を提出する"}
+                    ? activeLabels.resubmitDefinition
+                    : activeLabels.submitDefinition}
                 </button>
               </form>
             )
@@ -960,12 +1348,10 @@ export default function RoomLobby(
 
           {isOwner && pendingWriters.length === 0 && (
             <p class="published-note">
-              全員の意味が揃いました。整形画面に進みます。
+              {activeLabels.allSubmitted}
             </p>
           )}
-          {aiWritingRunning && (
-            <p class="muted">AI参加者が意味を書いています。</p>
-          )}
+          {aiWritingRunning && <p class="muted">{activeLabels.aiWriting}</p>}
         </section>
       )}
 
@@ -1040,7 +1426,7 @@ export default function RoomLobby(
 
       {room.currentPhase === "voting" && (
         <section class="phase-block">
-          <p class="muted">正しいと思う意味を1つ選びます。</p>
+          <p class="muted">{activeLabels.voteInstruction}</p>
           {selfMember?.isVoter
             ? (
               <form class="choice-list" onSubmit={handleSubmitVote}>
@@ -1087,7 +1473,7 @@ export default function RoomLobby(
       {room.currentPhase === "results" && (
         <section class="phase-block results-block">
           <div class="prompt-panel">
-            <p class="status-label">正しい意味</p>
+            <p class="status-label">{activeLabels.correctResultLabel}</p>
             <strong>{gameState.prompt?.word}</strong>
             <p>{gameState.prompt?.correctDefinition}</p>
           </div>
@@ -1117,7 +1503,7 @@ export default function RoomLobby(
           </div>
 
           <div class="score-board">
-            <p class="status-label">得点</p>
+            <p class="status-label">累積得点</p>
             {gameState.scores.map((score) => (
               <div class="score-row" key={score.userId}>
                 <span>{score.username}</span>
@@ -1126,6 +1512,38 @@ export default function RoomLobby(
                 </small>
                 <b>{score.totalPoints}</b>
               </div>
+            ))}
+          </div>
+
+          {isOwner && (
+            <button
+              type="button"
+              class="secondary-button"
+              disabled={viewState === "saving"}
+              onClick={handleStartNextRound}
+            >
+              次のラウンドへ
+            </button>
+          )}
+        </section>
+      )}
+
+      {roundSummaries.length > 0 && (
+        <section class="member-block">
+          <p class="field-label">履歴</p>
+          <div class="result-choice-list">
+            {roundSummaries.map((summary) => (
+              <article class="result-choice" key={summary.roundNumber}>
+                <div class="result-meta">
+                  <span>第{summary.roundNumber}ラウンド: {summary.word}</span>
+                  <b>{summary.topPoints}点</b>
+                </div>
+                <small>
+                  勝者: {summary.winners.length > 0
+                    ? summary.winners.join("、")
+                    : "なし"}
+                </small>
+              </article>
             ))}
           </div>
         </section>

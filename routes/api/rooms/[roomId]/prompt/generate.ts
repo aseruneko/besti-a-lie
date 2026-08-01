@@ -6,6 +6,7 @@ type RoomRow = {
   current_phase:
     | "waiting"
     | "prompt"
+    | "checking"
     | "writing"
     | "editing"
     | "voting"
@@ -17,7 +18,10 @@ type GeneratedPrompt = {
   correctDefinition: string;
 };
 
+type PromptMode = "normal" | "freeform";
+
 const missingOpenAiKeyMessage = "OPENAI_API_KEY がありません。";
+const hiraganaPattern = /^[ぁ-ゖー]+$/;
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -94,7 +98,10 @@ function extractJsonObject(value: string) {
   return trimmed.slice(firstBrace, lastBrace + 1);
 }
 
-function parseGeneratedPrompt(value: string): GeneratedPrompt {
+function parseGeneratedPrompt(
+  value: string,
+  mode: PromptMode,
+): GeneratedPrompt {
   const jsonText = extractJsonObject(value);
   const parsed = JSON.parse(jsonText) as Partial<GeneratedPrompt>;
   const word = String(parsed.word ?? "").trim();
@@ -104,11 +111,74 @@ function parseGeneratedPrompt(value: string): GeneratedPrompt {
     throw new Error("AIが有効なお題を返しませんでした。");
   }
 
+  if (mode === "normal" && !hiraganaPattern.test(word)) {
+    throw new Error("AIがひらがなの読みを返しませんでした。");
+  }
+
   if (correctDefinition.length < 1 || correctDefinition.length > 1200) {
     throw new Error("AIが有効な意味を返しませんでした。");
   }
 
   return { word, correctDefinition };
+}
+
+function getPromptGenerationInstructions(mode: PromptMode) {
+  if (mode === "freeform") {
+    return [
+      "あなたは雑学ゲームと事実確認に強い編集者です。",
+      "友人同士で遊ぶ『自由律たほいや』のお題を1件だけ作ってください。",
+      "このモードでは、プレイヤーは正解ではない架空回答を考えます。",
+      "word には、明確な正解がある雑学・事実テーマまたは短い問いを入れてください。",
+      "correctDefinition には、その問いへの正しい答えを具体的に書いてください。",
+      "歴史、文化、科学、地理、芸術、生活史などから、意外だが確かめやすい事実を選んでください。",
+      "架空回答を作る余地がある題材にしてください。単なる二択、計算問題、最新ニュース、炎上しやすい政治・事件・差別的題材は避けてください。",
+      "正解は創作、推測、俗説ではなく、事実として扱える内容にしてください。",
+      "JSON以外は出力しないでください。",
+      '形式: {"word":"...","correctDefinition":"..."}',
+    ].join("\n");
+  }
+
+  return [
+    "あなたは日本語の辞書と語彙ゲームに詳しい編集者です。",
+    "友人同士で遊ぶ『たほいや』のお題を1件だけ選んでください。",
+    "造語は禁止です。必ず実在する日本語の難しい単語だけを選んでください。",
+    "お題として表示する語は、漢字表記ではなく読みだけをひらがなで返してください。",
+    "word にはひらがなの読みだけを入れてください。漢字、カタカナ、英数字、記号、括弧、送り仮名の注記は禁止です。",
+    "correctDefinition には、必要に応じて漢字表記を含めて、その読みの単語の正しい意味を書いてください。",
+    "意味は辞書的に正しい内容にしてください。推測、創作、俗説は禁止です。",
+    "一般的すぎる語、固有名詞、専門家でないと不快になりうる語、差別語、性的な語は避けてください。",
+    "プレイヤーが偽の意味を書きやすい、聞き慣れないが短めの語を優先してください。",
+    "JSON以外は出力しないでください。",
+    '形式: {"word":"...","correctDefinition":"..."}',
+  ].join("\n");
+}
+
+function getPromptGenerationInput(mode: PromptMode) {
+  return mode === "freeform"
+    ? "自由律たほいや向けのお題と正解を1件生成してください。"
+    : "たほいや向けのお題を1件生成してください。";
+}
+
+function getJsonSchema(mode: PromptMode) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      word: {
+        type: "string",
+        description: mode === "freeform"
+          ? "明確な正解がある雑学・事実テーマまたは短い問い"
+          : "実在する難しい日本語単語の読み。ひらがなのみ。",
+      },
+      correctDefinition: {
+        type: "string",
+        description: mode === "freeform"
+          ? "そのテーマまたは問いへの正しい答え"
+          : "その単語の辞書的に正しい日本語の意味",
+      },
+    },
+    required: ["word", "correctDefinition"],
+  };
 }
 
 function getIncompleteReason(responseJson: Record<string, unknown>) {
@@ -138,7 +208,7 @@ function extractOpenAiErrorMessage(errorBody: string) {
   return errorBody.trim().slice(0, 500);
 }
 
-async function createGeneratedPrompt(openAiKey: string) {
+async function createGeneratedPrompt(openAiKey: string, mode: PromptMode) {
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -147,38 +217,15 @@ async function createGeneratedPrompt(openAiKey: string) {
     },
     body: JSON.stringify({
       model: Deno.env.get("OPENAI_MODEL") ?? "gpt-5",
-      instructions: [
-        "あなたは日本語の辞書と語彙ゲームに詳しい編集者です。",
-        "友人同士で遊ぶ『たほいや』のお題を1件だけ選んでください。",
-        "造語は禁止です。必ず実在する日本語の難しい単語だけを選んでください。",
-        "意味は辞書的に正しい内容にしてください。推測、創作、俗説は禁止です。",
-        "一般的すぎる語、固有名詞、専門家でないと不快になりうる語、差別語、性的な語は避けてください。",
-        "プレイヤーが偽の意味を書きやすい、聞き慣れないが短めの語を優先してください。",
-        "JSON以外は出力しないでください。",
-        '形式: {"word":"...","correctDefinition":"..."}',
-      ].join("\n"),
-      input: "たほいや向けのお題を1件生成してください。",
+      instructions: getPromptGenerationInstructions(mode),
+      input: getPromptGenerationInput(mode),
       text: {
         verbosity: "low",
         format: {
           type: "json_schema",
           name: "tahoiya_prompt",
           strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              word: {
-                type: "string",
-                description: "実在する難しい日本語単語",
-              },
-              correctDefinition: {
-                type: "string",
-                description: "その単語の辞書的に正しい日本語の意味",
-              },
-            },
-            required: ["word", "correctDefinition"],
-          },
+          schema: getJsonSchema(mode),
         },
       },
       max_output_tokens: 4096,
@@ -206,7 +253,7 @@ async function createGeneratedPrompt(openAiKey: string) {
 
   const outputText = extractOutputText(responseJson);
   try {
-    return parseGeneratedPrompt(outputText);
+    return parseGeneratedPrompt(outputText, mode);
   } catch (error) {
     console.error("Failed to parse generated prompt", {
       error,
@@ -233,6 +280,17 @@ export const handler: Handlers = {
     }
 
     const roomId = ctx.params.roomId;
+    const requestBody = await req.json().catch(() => ({})) as {
+      mode?: unknown;
+    };
+    const mode = requestBody.mode === "freeform" ? "freeform" : "normal";
+    if (
+      requestBody.mode !== undefined &&
+      requestBody.mode !== "normal" &&
+      requestBody.mode !== "freeform"
+    ) {
+      return jsonResponse({ error: "Unknown prompt mode" }, 400);
+    }
     const supabase = makeSupabaseClient(token);
     const { data: userData, error: userError } = await supabase.auth.getUser(
       token,
@@ -264,7 +322,7 @@ export const handler: Handlers = {
     }
 
     try {
-      return jsonResponse(await createGeneratedPrompt(openAiKey));
+      return jsonResponse(await createGeneratedPrompt(openAiKey, mode));
     } catch (error) {
       console.error("Prompt generation failed", error);
       return jsonResponse(

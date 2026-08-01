@@ -12,9 +12,9 @@ create table if not exists public.rooms (
   id uuid primary key default gen_random_uuid(),
   owner_id uuid not null references public.profiles(id) on delete cascade,
   current_phase text not null default 'waiting'
-    check (current_phase in ('waiting', 'prompt', 'writing', 'editing', 'voting', 'results')),
+    check (current_phase in ('waiting', 'prompt', 'checking', 'writing', 'editing', 'voting', 'results')),
   include_master_as_player boolean not null default false,
-  current_round integer not null default 1 check (current_round = 1),
+  current_round integer not null default 1 check (current_round >= 1),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -43,12 +43,53 @@ create table if not exists public.room_ai_participants (
 create table if not exists public.prompts (
   id uuid primary key default gen_random_uuid(),
   room_id uuid not null references public.rooms(id) on delete cascade,
-  round_number integer not null default 1 check (round_number = 1),
+  round_number integer not null default 1 check (round_number >= 1),
+  mode text not null default 'normal' check (mode in ('normal', 'freeform')),
   word text not null check (char_length(word) between 1 and 80),
   correct_definition text not null check (char_length(correct_definition) between 1 and 1200),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (room_id, round_number)
+);
+
+alter table public.rooms
+drop constraint if exists rooms_current_phase_check;
+
+alter table public.rooms
+drop constraint if exists rooms_current_round_check;
+
+alter table public.rooms
+add constraint rooms_current_phase_check
+check (current_phase in ('waiting', 'prompt', 'checking', 'writing', 'editing', 'voting', 'results'));
+
+alter table public.rooms
+add constraint rooms_current_round_check
+check (current_round >= 1);
+
+alter table public.prompts
+drop constraint if exists prompts_round_number_check;
+
+alter table public.prompts
+add constraint prompts_round_number_check
+check (round_number >= 1);
+
+alter table public.prompts
+add column if not exists mode text not null default 'normal';
+
+alter table public.prompts
+drop constraint if exists prompts_mode_check;
+
+alter table public.prompts
+add constraint prompts_mode_check
+check (mode in ('normal', 'freeform'));
+
+create table if not exists public.prompt_knowledge_checks (
+  prompt_id uuid not null references public.prompts(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  knows_word boolean not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (prompt_id, user_id)
 );
 
 create table if not exists public.definitions (
@@ -372,10 +413,13 @@ begin
 end;
 $$;
 
+drop function if exists public.start_prompt(uuid, text, text);
+
 create or replace function public.start_prompt(
   target_room_id uuid,
   next_word text,
-  next_correct_definition text
+  next_correct_definition text,
+  next_mode text default 'normal'
 )
 returns void
 language plpgsql
@@ -389,9 +433,14 @@ declare
 begin
   next_word := btrim(next_word);
   next_correct_definition := btrim(next_correct_definition);
+  next_mode := coalesce(nullif(btrim(next_mode), ''), 'normal');
 
   if char_length(next_word) < 1 or char_length(next_word) > 80 then
     raise exception 'Word must be between 1 and 80 characters';
+  end if;
+
+  if next_mode not in ('normal', 'freeform') then
+    raise exception 'Prompt mode must be normal or freeform';
   end if;
 
   if char_length(next_correct_definition) < 1 or char_length(next_correct_definition) > 1200 then
@@ -434,16 +483,18 @@ begin
   insert into public.prompts (
     room_id,
     round_number,
+    mode,
     word,
     correct_definition
   )
-  select target_room_id, 1, next_word, next_correct_definition
+  select target_room_id, r.current_round, next_mode, next_word, next_correct_definition
   from public.rooms r
   where r.id = target_room_id
     and r.owner_id = current_user_id
     and r.current_phase in ('waiting', 'prompt')
   on conflict (room_id, round_number)
-  do update set word = excluded.word,
+  do update set mode = excluded.mode,
+                word = excluded.word,
                 correct_definition = excluded.correct_definition,
                 updated_at = now();
 
@@ -451,12 +502,122 @@ begin
     raise exception 'Only the room master can start the prompt';
   end if;
 
+  delete from public.prompt_knowledge_checks
+  where prompt_id in (
+    select id
+    from public.prompts
+    where room_id = target_room_id
+      and round_number = (
+        select current_round
+        from public.rooms
+        where id = target_room_id
+      )
+  );
+
+  update public.rooms
+  set current_phase = 'checking',
+      updated_at = now()
+  where id = target_room_id
+    and owner_id = current_user_id
+    and current_phase in ('waiting', 'prompt');
+end;
+$$;
+
+create or replace function public.submit_prompt_knowledge(
+  target_room_id uuid,
+  next_knows_word boolean
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_user_id uuid := auth.uid();
+  prompt_id_value uuid;
+begin
+  select p.id into prompt_id_value
+  from public.prompts p
+  join public.rooms r on r.id = p.room_id
+  where p.room_id = target_room_id
+    and p.round_number = r.current_round
+    and r.current_phase = 'checking'
+    and r.owner_id <> current_user_id
+    and public.is_room_member(target_room_id, current_user_id);
+
+  if prompt_id_value is null then
+    raise exception 'You cannot answer this prompt check';
+  end if;
+
+  insert into public.prompt_knowledge_checks (
+    prompt_id,
+    user_id,
+    knows_word
+  )
+  values (
+    prompt_id_value,
+    current_user_id,
+    next_knows_word
+  )
+  on conflict (prompt_id, user_id)
+  do update set knows_word = excluded.knows_word,
+                updated_at = now();
+end;
+$$;
+
+create or replace function public.continue_prompt_after_check(target_room_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_user_id uuid := auth.uid();
+begin
   update public.rooms
   set current_phase = 'writing',
       updated_at = now()
   where id = target_room_id
     and owner_id = current_user_id
-    and current_phase in ('waiting', 'prompt');
+    and current_phase = 'checking';
+
+  if not found then
+    raise exception 'Only the room master can continue after prompt check';
+  end if;
+end;
+$$;
+
+create or replace function public.cancel_prompt_after_check(target_room_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_user_id uuid := auth.uid();
+  prompt_id_value uuid;
+begin
+  select p.id into prompt_id_value
+  from public.prompts p
+  join public.rooms r on r.id = p.room_id
+  where p.room_id = target_room_id
+    and p.round_number = r.current_round
+    and r.owner_id = current_user_id
+    and r.current_phase = 'checking';
+
+  if prompt_id_value is null then
+    raise exception 'Only the room master can cancel after prompt check';
+  end if;
+
+  delete from public.prompt_knowledge_checks
+  where prompt_id = prompt_id_value;
+
+  update public.rooms
+  set current_phase = 'prompt',
+      updated_at = now()
+  where id = target_room_id
+    and owner_id = current_user_id
+    and current_phase = 'checking';
 end;
 $$;
 
@@ -489,7 +650,7 @@ begin
   from public.prompts p
   join public.rooms r on r.id = p.room_id
   where p.room_id = target_room_id
-    and p.round_number = 1
+    and p.round_number = r.current_round
     and r.current_phase = 'writing';
 
   if prompt_record.id is null then
@@ -578,7 +739,7 @@ begin
   from public.prompts p
   join public.rooms r on r.id = p.room_id
   where p.room_id = target_room_id
-    and p.round_number = 1
+    and p.round_number = r.current_round
     and r.current_phase = 'writing';
 
   if prompt_record.id is null then
@@ -653,7 +814,7 @@ begin
   from public.prompts p
   join public.rooms r on r.id = p.room_id
   where p.room_id = target_room_id
-    and p.round_number = 1
+    and p.round_number = r.current_round
     and r.owner_id = current_user_id
     and r.current_phase = 'editing';
 
@@ -765,7 +926,7 @@ begin
   from public.prompts p
   join public.rooms r on r.id = p.room_id
   where p.room_id = target_room_id
-    and p.round_number = 1
+    and p.round_number = r.current_round
     and r.current_phase = 'voting';
 
   if prompt_record.id is null then
@@ -840,7 +1001,7 @@ begin
   from public.prompts p
   join public.rooms r on r.id = p.room_id
   where p.room_id = target_room_id
-    and p.round_number = 1
+    and p.round_number = r.current_round
     and r.owner_id = current_user_id
     and r.current_phase = 'voting';
 
@@ -869,6 +1030,29 @@ begin
 end;
 $$;
 
+create or replace function public.start_next_round(target_room_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  current_user_id uuid := auth.uid();
+begin
+  update public.rooms
+  set current_round = current_round + 1,
+      current_phase = 'waiting',
+      updated_at = now()
+  where id = target_room_id
+    and owner_id = current_user_id
+    and current_phase = 'results';
+
+  if not found then
+    raise exception 'Only the room master can start the next round after results';
+  end if;
+end;
+$$;
+
 create or replace function public.get_room_game_state(target_room_id uuid)
 returns jsonb
 language plpgsql
@@ -883,9 +1067,11 @@ declare
   members_json jsonb := '[]'::jsonb;
   own_definition_json jsonb := null;
   draft_definitions_json jsonb := '[]'::jsonb;
+  knowledge_checks_json jsonb := '[]'::jsonb;
   choices_json jsonb := '[]'::jsonb;
   results_json jsonb := '[]'::jsonb;
   scores_json jsonb := '[]'::jsonb;
+  round_summaries_json jsonb := '[]'::jsonb;
   own_vote_choice_id uuid;
   include_secret boolean := false;
 begin
@@ -908,7 +1094,7 @@ begin
   select * into prompt_record
   from public.prompts
   where room_id = target_room_id
-    and round_number = 1;
+    and round_number = room_record.current_round;
 
   include_secret := room_record.owner_id = current_user_id
     or room_record.current_phase = 'results';
@@ -971,6 +1157,32 @@ begin
   ) member_rows;
 
   if prompt_record.id is not null then
+    select coalesce(jsonb_agg(jsonb_build_object(
+      'userId', knowledge_rows.user_id,
+      'username', knowledge_rows.username,
+      'knowsWord', knowledge_rows.knows_word,
+      'hasAnswered', knowledge_rows.knows_word is not null
+    ) order by knowledge_rows.joined_at, knowledge_rows.user_id), '[]'::jsonb)
+    into knowledge_checks_json
+    from (
+      select
+        rm.user_id,
+        rm.joined_at,
+        p.username,
+        pkc.knows_word
+      from public.room_members rm
+      join public.profiles p on p.id = rm.user_id
+      left join public.prompt_knowledge_checks pkc
+        on pkc.prompt_id = prompt_record.id
+       and pkc.user_id = rm.user_id
+      where rm.room_id = target_room_id
+        and rm.user_id <> room_record.owner_id
+        and (
+          room_record.owner_id = current_user_id
+          or rm.user_id = current_user_id
+        )
+    ) knowledge_rows;
+
     select jsonb_build_object('id', d.id, 'body', d.body)
     into own_definition_json
     from public.definitions d
@@ -1080,6 +1292,126 @@ begin
     end if;
   end if;
 
+  with completed_prompts as (
+    select p.id, p.round_number
+    from public.prompts p
+    where p.room_id = target_room_id
+      and (
+        p.round_number < room_record.current_round
+        or (
+          p.round_number = room_record.current_round
+          and room_record.current_phase = 'results'
+        )
+      )
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'userId', score_rows.user_id,
+    'username', score_rows.username,
+    'correctPoints', score_rows.correct_points,
+    'bluffPoints', score_rows.bluff_points,
+    'totalPoints', score_rows.correct_points + score_rows.bluff_points
+  ) order by (score_rows.correct_points + score_rows.bluff_points) desc, score_rows.username), '[]'::jsonb)
+  into scores_json
+  from (
+    select
+      rm.user_id,
+      p.username,
+      (
+        select count(*)::integer
+        from public.votes v_correct
+        join public.published_choices pc_correct
+          on pc_correct.id = v_correct.choice_id
+        join completed_prompts cp
+          on cp.id = pc_correct.prompt_id
+        where v_correct.voter_id = rm.user_id
+          and pc_correct.is_correct
+      ) as correct_points,
+      (
+        select count(*)::integer
+        from public.definitions d
+        join completed_prompts cp
+          on cp.id = d.prompt_id
+        join public.published_choices pc_bluff
+          on pc_bluff.source_definition_id = d.id
+        join public.votes v_bluff
+          on v_bluff.choice_id = pc_bluff.id
+        where d.author_id = rm.user_id
+      ) as bluff_points
+    from public.room_members rm
+    join public.profiles p on p.id = rm.user_id
+    where rm.room_id = target_room_id
+  ) score_rows;
+
+  with completed_prompts as (
+    select p.id, p.round_number, p.word
+    from public.prompts p
+    where p.room_id = target_room_id
+      and (
+        p.round_number < room_record.current_round
+        or (
+          p.round_number = room_record.current_round
+          and room_record.current_phase = 'results'
+        )
+      )
+  ),
+  round_scores as (
+    select
+      cp.id as prompt_id,
+      cp.round_number,
+      cp.word,
+      rm.user_id,
+      prof.username,
+      (
+        count(distinct v_correct.choice_id)
+        + count(v_bluff.voter_id)
+      )::integer as total_points
+    from completed_prompts cp
+    cross join public.room_members rm
+    join public.profiles prof on prof.id = rm.user_id
+    left join public.votes v_correct
+      on v_correct.prompt_id = cp.id
+     and v_correct.voter_id = rm.user_id
+     and exists (
+       select 1
+       from public.published_choices pc
+       where pc.id = v_correct.choice_id
+         and pc.is_correct
+     )
+    left join public.definitions d
+      on d.prompt_id = cp.id
+     and d.author_id = rm.user_id
+    left join public.published_choices pc_bluff
+      on pc_bluff.source_definition_id = d.id
+    left join public.votes v_bluff
+      on v_bluff.choice_id = pc_bluff.id
+    where rm.room_id = target_room_id
+    group by cp.id, cp.round_number, cp.word, rm.user_id, prof.username
+  ),
+  round_max as (
+    select prompt_id, max(total_points) as top_points
+    from round_scores
+    group by prompt_id
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'roundNumber', summary_rows.round_number,
+    'word', summary_rows.word,
+    'winners', summary_rows.winners,
+    'topPoints', summary_rows.top_points
+  ) order by summary_rows.round_number), '[]'::jsonb)
+  into round_summaries_json
+  from (
+    select
+      rs.prompt_id,
+      rs.round_number,
+      rs.word,
+      rm.top_points,
+      coalesce(jsonb_agg(rs.username order by rs.username)
+        filter (where rs.total_points = rm.top_points), '[]'::jsonb) as winners
+    from round_scores rs
+    join round_max rm on rm.prompt_id = rs.prompt_id
+    group by rs.prompt_id, rs.round_number, rs.word, rm.top_points
+  ) summary_rows;
+
   return jsonb_build_object(
     'room', jsonb_build_object(
       'id', room_record.id,
@@ -1092,18 +1424,25 @@ begin
     'prompt',
       case
         when prompt_record.id is null then null
+        when room_record.current_phase = 'prompt' and not include_secret then null
         when include_secret then jsonb_build_object(
+          'mode', prompt_record.mode,
           'word', prompt_record.word,
           'correctDefinition', prompt_record.correct_definition
         )
-        else jsonb_build_object('word', prompt_record.word)
+        else jsonb_build_object(
+          'mode', prompt_record.mode,
+          'word', prompt_record.word
+        )
       end,
     'ownDefinition', own_definition_json,
     'draftDefinitions', draft_definitions_json,
+    'knowledgeChecks', knowledge_checks_json,
     'choices', choices_json,
     'ownVoteChoiceId', own_vote_choice_id,
     'results', results_json,
-    'scores', scores_json
+    'scores', scores_json,
+    'roundSummaries', round_summaries_json
   );
 end;
 $$;
@@ -1112,12 +1451,16 @@ grant execute on function public.join_room(uuid) to authenticated;
 grant execute on function public.set_room_include_master(uuid, boolean) to authenticated;
 grant execute on function public.set_room_ai_participant_count(uuid, integer) to authenticated;
 grant execute on function public.set_room_ai_participant_personality(uuid, uuid, text) to authenticated;
-grant execute on function public.start_prompt(uuid, text, text) to authenticated;
+grant execute on function public.start_prompt(uuid, text, text, text) to authenticated;
+grant execute on function public.submit_prompt_knowledge(uuid, boolean) to authenticated;
+grant execute on function public.continue_prompt_after_check(uuid) to authenticated;
+grant execute on function public.cancel_prompt_after_check(uuid) to authenticated;
 grant execute on function public.submit_definition(uuid, text) to authenticated;
 grant execute on function public.submit_ai_definition(uuid, uuid, text) to authenticated;
 grant execute on function public.publish_choices(uuid, jsonb) to authenticated;
 grant execute on function public.submit_vote(uuid, uuid) to authenticated;
 grant execute on function public.reveal_results(uuid) to authenticated;
+grant execute on function public.start_next_round(uuid) to authenticated;
 grant execute on function public.get_room_game_state(uuid) to authenticated;
 
 alter table public.profiles enable row level security;
@@ -1125,6 +1468,7 @@ alter table public.rooms enable row level security;
 alter table public.room_members enable row level security;
 alter table public.room_ai_participants enable row level security;
 alter table public.prompts enable row level security;
+alter table public.prompt_knowledge_checks enable row level security;
 alter table public.definitions enable row level security;
 alter table public.published_choices enable row level security;
 alter table public.votes enable row level security;
@@ -1214,6 +1558,14 @@ using (public.is_room_member(room_id, auth.uid()));
 
 drop policy if exists "Owners can view prompt rows"
 on public.prompts;
+drop policy if exists "Room members can view prompt knowledge checks"
+on public.prompt_knowledge_checks;
+drop policy if exists "Human members can upsert their prompt knowledge"
+on public.prompt_knowledge_checks;
+drop policy if exists "Human members can insert their prompt knowledge"
+on public.prompt_knowledge_checks;
+drop policy if exists "Human members can update their prompt knowledge"
+on public.prompt_knowledge_checks;
 drop policy if exists "Members can view their own definitions"
 on public.definitions;
 drop policy if exists "Members can view published choices after voting"
@@ -1233,6 +1585,65 @@ using (
     from public.rooms r
     where r.id = room_id
       and r.owner_id = auth.uid()
+  )
+);
+
+create policy "Room members can view prompt knowledge checks"
+on public.prompt_knowledge_checks
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.prompts p
+    where p.id = prompt_id
+      and public.is_room_member(p.room_id, auth.uid())
+  )
+);
+
+create policy "Human members can insert their prompt knowledge"
+on public.prompt_knowledge_checks
+for insert
+to authenticated
+with check (
+  user_id = auth.uid()
+  and exists (
+    select 1
+    from public.prompts p
+    join public.rooms r on r.id = p.room_id
+    where p.id = prompt_id
+      and r.current_phase = 'checking'
+      and r.owner_id <> auth.uid()
+      and public.is_room_member(p.room_id, auth.uid())
+  )
+);
+
+create policy "Human members can update their prompt knowledge"
+on public.prompt_knowledge_checks
+for update
+to authenticated
+using (
+  user_id = auth.uid()
+  and exists (
+    select 1
+    from public.prompts p
+    join public.rooms r on r.id = p.room_id
+    where p.id = prompt_id
+      and r.current_phase = 'checking'
+      and r.owner_id <> auth.uid()
+      and public.is_room_member(p.room_id, auth.uid())
+  )
+)
+with check (
+  user_id = auth.uid()
+  and exists (
+    select 1
+    from public.prompts p
+    join public.rooms r on r.id = p.room_id
+    where p.id = prompt_id
+      and r.current_phase = 'checking'
+      and r.owner_id <> auth.uid()
+      and public.is_room_member(p.room_id, auth.uid())
   )
 );
 
@@ -1311,6 +1722,16 @@ begin
       and tablename = 'prompts'
   ) then
     alter publication supabase_realtime add table public.prompts;
+  end if;
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'prompt_knowledge_checks'
+  ) then
+    alter publication supabase_realtime add table public.prompt_knowledge_checks;
   end if;
 
   if not exists (

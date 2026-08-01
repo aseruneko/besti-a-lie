@@ -22,6 +22,7 @@ type Profile = {
 type RoomPhase =
   | "waiting"
   | "prompt"
+  | "checking"
   | "writing"
   | "editing"
   | "voting"
@@ -45,11 +46,13 @@ type RoomRow = {
   id: string;
   owner_id: string;
   current_phase: RoomPhase;
+  current_round: number;
   created_at: string;
 };
 
 type PromptRow = {
   room_id: string;
+  round_number: number;
   word: string;
 };
 
@@ -111,7 +114,7 @@ export default function HomeApp(
 
       const { data: roomRows, error: roomError } = await client
         .from("rooms")
-        .select("id, owner_id, current_phase, created_at")
+        .select("id, owner_id, current_phase, current_round, created_at")
         .in("id", roomIds)
         .returns<RoomRow[]>();
 
@@ -119,7 +122,7 @@ export default function HomeApp(
 
       const { data: promptRows, error: promptError } = await client
         .from("prompts")
-        .select("room_id, word")
+        .select("room_id, round_number, word")
         .in("room_id", roomIds)
         .returns<PromptRow[]>();
 
@@ -129,10 +132,13 @@ export default function HomeApp(
         room.id,
         room,
       ]));
-      const wordsByRoomId = new Map((promptRows ?? []).map((prompt) => [
-        prompt.room_id,
-        prompt.word,
-      ]));
+      const wordsByRoomId = new Map(
+        (promptRows ?? []).flatMap((prompt) => {
+          const room = roomsById.get(prompt.room_id);
+          if (!room || room.current_round !== prompt.round_number) return [];
+          return [[prompt.room_id, prompt.word] as const];
+        }),
+      );
 
       return (memberRows ?? []).flatMap((memberRow) => {
         const room = roomsById.get(memberRow.room_id);
@@ -295,6 +301,7 @@ export default function HomeApp(
   function formatRoomPhase(phase: RoomPhase) {
     if (phase === "waiting") return "待合";
     if (phase === "prompt") return "出題";
+    if (phase === "checking") return "既知確認";
     if (phase === "writing") return "意味提出";
     if (phase === "editing") return "整形";
     if (phase === "voting") return "投票";
