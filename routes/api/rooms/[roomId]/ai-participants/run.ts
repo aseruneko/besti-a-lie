@@ -39,6 +39,7 @@ type PersonalityPrompt = {
 };
 
 const missingOpenAiKeyMessage = "OPENAI_API_KEY がありません。";
+const fallbackDefinition = "生成に失敗しました";
 
 const personalityPrompts: Record<AiPersonality, PersonalityPrompt> = {
   normal: {
@@ -222,6 +223,41 @@ async function createAiDefinition(
   return body;
 }
 
+async function createAiDefinitionWithRetries(
+  openAiKey: string,
+  word: string,
+  aiParticipant: AiParticipantRow,
+  generatedDefinitions: string[],
+) {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await createAiDefinition(
+        openAiKey,
+        word,
+        aiParticipant,
+        generatedDefinitions,
+      );
+    } catch (error) {
+      lastError = error;
+      console.error("AI participant definition attempt failed", {
+        aiParticipantId: aiParticipant.id,
+        slot: aiParticipant.slot,
+        attempt,
+        error,
+      });
+    }
+  }
+
+  console.error("AI participant definition fell back", {
+    aiParticipantId: aiParticipant.id,
+    slot: aiParticipant.slot,
+    error: lastError,
+  });
+  return fallbackDefinition;
+}
+
 export const handler: Handlers = {
   async POST(req, ctx) {
     const openAiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
@@ -288,41 +324,38 @@ export const handler: Handlers = {
     const aiById = new Map(aiRows.map((row) => [row.id, row]));
     const generatedDefinitions: string[] = [];
     let submitted = 0;
+    let fallbackSubmitted = 0;
 
-    try {
-      for (const aiId of pendingAiIds) {
-        const aiParticipant = aiById.get(aiId);
-        if (!aiParticipant) continue;
+    for (const aiId of pendingAiIds) {
+      const aiParticipant = aiById.get(aiId);
+      if (!aiParticipant) continue;
 
-        const body = await createAiDefinition(
-          openAiKey,
-          gameState.prompt.word,
-          aiParticipant,
-          generatedDefinitions,
-        );
-
-        const { error } = await supabase.rpc("submit_ai_definition", {
-          target_room_id: roomId,
-          target_ai_participant_id: aiParticipant.id,
-          next_body: body,
-        });
-
-        if (error) throw new Error(error.message);
-        generatedDefinitions.push(body);
-        submitted += 1;
-      }
-    } catch (error) {
-      console.error("AI participant generation failed", error);
-      return jsonResponse(
-        {
-          error: error instanceof Error
-            ? error.message
-            : "AI参加者の意味生成に失敗しました。",
-        },
-        500,
+      const body = await createAiDefinitionWithRetries(
+        openAiKey,
+        gameState.prompt.word,
+        aiParticipant,
+        generatedDefinitions,
       );
+
+      const { error } = await supabase.rpc("submit_ai_definition", {
+        target_room_id: roomId,
+        target_ai_participant_id: aiParticipant.id,
+        next_body: body,
+      });
+
+      if (error) {
+        console.error("AI participant fallback submit failed", {
+          aiParticipantId: aiParticipant.id,
+          error,
+        });
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      generatedDefinitions.push(body);
+      submitted += 1;
+      if (body === fallbackDefinition) fallbackSubmitted += 1;
     }
 
-    return jsonResponse({ submitted });
+    return jsonResponse({ submitted, fallbackSubmitted });
   },
 };
