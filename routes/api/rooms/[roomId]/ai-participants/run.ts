@@ -1,8 +1,10 @@
 import type { Handlers } from "$fresh/server.ts";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-
-type AiPersonality = "normal" | "weird" | "formal" | "archaic" | "technical";
-type PromptMode = "normal" | "freeform";
+import {
+  type AiPersonality,
+  getAiDefinitionPrompt,
+  type PromptMode,
+} from "../../../../../lib/aiPrompts.ts";
 
 type Member = {
   aiParticipantId?: string | null;
@@ -36,60 +38,9 @@ type AiParticipantRow = {
   personality: AiPersonality;
 };
 
-type PersonalityPrompt = {
-  label: string;
-  direction: string;
-};
-
 const missingOpenAiKeyMessage = "OPENAI_API_KEY がありません。";
 const fallbackDefinition = "生成に失敗しました";
-
-const personalityPrompts: Record<AiPersonality, PersonalityPrompt> = {
-  normal: {
-    label: "ふつうAI",
-    direction: "自然な辞書調で、もっともらしい語義を書いてください。",
-  },
-  weird: {
-    label: "へんなAI",
-    direction:
-      "少し意外な連想を含めつつ、辞書に載っていそうな落ち着いた語義にしてください。",
-  },
-  formal: {
-    label: "硬派な辞書AI",
-    direction: "硬めの国語辞典のように、簡潔で抽象度の高い語義にしてください。",
-  },
-  archaic: {
-    label: "古語っぽいAI",
-    direction: "古語・雅語・文語の雰囲気を少し含む語義にしてください。",
-  },
-  technical: {
-    label: "専門用語AI",
-    direction: "学術用語や専門分野の語義に見える説明にしてください。",
-  },
-};
-
-const freeformPersonalityPrompts: Record<AiPersonality, PersonalityPrompt> = {
-  normal: {
-    label: "ふつうAI",
-    direction: "自然な雑学回答らしく、短くもっともらしく書いてください。",
-  },
-  weird: {
-    label: "へんなAI",
-    direction: "少し意外な因果や偶然を含めつつ、ありそうな回答にしてください。",
-  },
-  formal: {
-    label: "硬派な辞書AI",
-    direction: "百科事典や解説文のような落ち着いた文体にしてください。",
-  },
-  archaic: {
-    label: "古語っぽいAI",
-    direction: "古い記録や逸話にありそうな雰囲気を少し含めてください。",
-  },
-  technical: {
-    label: "専門用語AI",
-    direction: "専門分野の知見に見える説明にしてください。",
-  },
-};
+const aiDefinitionAttemptTimeoutMs = 12_000;
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -184,45 +135,21 @@ function extractOpenAiErrorMessage(errorBody: string) {
   return errorBody.trim().slice(0, 500);
 }
 
-function getAiDefinitionPrompt(
-  mode: PromptMode,
-  aiParticipant: AiParticipantRow,
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit,
+  timeoutMs: number,
 ) {
-  if (mode === "freeform") {
-    const personality = freeformPersonalityPrompts[aiParticipant.personality] ??
-      freeformPersonalityPrompts.normal;
-    return {
-      instructions: [
-        "あなたは『自由律たほいや』に参加するAI回答者です。",
-        "与えられたお題について、正解ではない架空の回答を1件だけ作ってください。",
-        "正解は渡されていません。実在しそうなエピソード、雑学、事実のように書いてください。",
-        "プレイヤーが正解と迷うように、具体性を少し入れてください。",
-        "本文だけを出力してください。見出し、箇条書き、引用符、説明は不要です。",
-        "120文字以内の短い1文で出力してください。",
-        `あなたの個性: ${personality.label}`,
-        personality.direction,
-      ].join("\n"),
-      inputLabel: "お題",
-      existingLabel: "このリクエスト内ですでに生成済みの架空回答:",
-    };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const personality = personalityPrompts[aiParticipant.personality] ??
-    personalityPrompts.normal;
-  return {
-    instructions: [
-      "あなたは『たほいや』に参加するAI回答者です。",
-      "与えられたお題語について、正解ではない偽の意味を1件だけ作ってください。",
-      "ただし、プレイヤーが正解と迷うように、実在語義らしい辞書調で書いてください。",
-      "正しい意味を知っているふりをして断定しすぎず、もっともらしい別語義にしてください。",
-      "本文だけを出力してください。見出し、箇条書き、引用符、説明は不要です。",
-      "80文字以内の短い1文で出力してください。",
-      `あなたの個性: ${personality.label}`,
-      personality.direction,
-    ].join("\n"),
-    inputLabel: "お題語",
-    existingLabel: "このリクエスト内ですでに生成済みの偽意味:",
-  };
 }
 
 async function createAiDefinition(
@@ -234,31 +161,35 @@ async function createAiDefinition(
 ) {
   const prompt = getAiDefinitionPrompt(
     mode,
-    aiParticipant,
+    aiParticipant.personality,
   );
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${openAiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: Deno.env.get("OPENAI_MODEL") ?? "gpt-5",
-      instructions: prompt.instructions,
-      input: [
-        `${prompt.inputLabel}: ${word}`,
-        `AI枠: ${aiParticipant.slot}`,
-        prompt.existingLabel,
-        generatedDefinitions.length > 0
-          ? generatedDefinitions.join("\n")
-          : "なし",
-      ].join("\n"),
-      text: {
-        verbosity: "low",
+  const response = await fetchWithTimeout(
+    "https://api.openai.com/v1/responses",
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${openAiKey}`,
+        "content-type": "application/json",
       },
-      max_output_tokens: 2048,
-    }),
-  });
+      body: JSON.stringify({
+        model: Deno.env.get("OPENAI_MODEL") ?? "gpt-5",
+        instructions: prompt.instructions,
+        input: [
+          `${prompt.inputLabel}: ${word}`,
+          `AI枠: ${aiParticipant.slot}`,
+          prompt.existingLabel,
+          generatedDefinitions.length > 0
+            ? generatedDefinitions.join("\n")
+            : "なし",
+        ].join("\n"),
+        text: {
+          verbosity: "low",
+        },
+        max_output_tokens: 512,
+      }),
+    },
+    aiDefinitionAttemptTimeoutMs,
+  );
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -385,22 +316,26 @@ export const handler: Handlers = {
     }
 
     const aiById = new Map(aiRows.map((row) => [row.id, row]));
-    const generatedDefinitions: string[] = [];
+    const generatedDefinitions = await Promise.all(
+      pendingAiIds.flatMap((aiId) => {
+        const aiParticipant = aiById.get(aiId);
+        if (!aiParticipant) return [];
+
+        return [
+          createAiDefinitionWithRetries(
+            openAiKey,
+            gameState.prompt!.word,
+            gameState.prompt!.mode ?? "normal",
+            aiParticipant,
+            [],
+          ).then((body) => ({ aiParticipant, body })),
+        ];
+      }),
+    );
+
     let submitted = 0;
     let fallbackSubmitted = 0;
-
-    for (const aiId of pendingAiIds) {
-      const aiParticipant = aiById.get(aiId);
-      if (!aiParticipant) continue;
-
-      const body = await createAiDefinitionWithRetries(
-        openAiKey,
-        gameState.prompt.word,
-        gameState.prompt.mode ?? "normal",
-        aiParticipant,
-        generatedDefinitions,
-      );
-
+    for (const { aiParticipant, body } of generatedDefinitions) {
       const { error } = await supabase.rpc("submit_ai_definition", {
         target_room_id: roomId,
         target_ai_participant_id: aiParticipant.id,
@@ -415,7 +350,6 @@ export const handler: Handlers = {
         return jsonResponse({ error: error.message }, 500);
       }
 
-      generatedDefinitions.push(body);
       submitted += 1;
       if (body === fallbackDefinition) fallbackSubmitted += 1;
     }

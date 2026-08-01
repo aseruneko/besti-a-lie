@@ -1,5 +1,9 @@
 import type { Handlers } from "$fresh/server.ts";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import {
+  getPromptGenerationPrompt,
+  type PromptMode,
+} from "../../../../../lib/aiPrompts.ts";
 
 type RoomRow = {
   owner_id: string;
@@ -17,8 +21,6 @@ type GeneratedPrompt = {
   word: string;
   correctDefinition: string;
 };
-
-type PromptMode = "normal" | "freeform";
 
 const missingOpenAiKeyMessage = "OPENAI_API_KEY がありません。";
 const hiraganaPattern = /^[ぁ-ゖー]+$/;
@@ -122,59 +124,19 @@ function parseGeneratedPrompt(
   return { word, correctDefinition };
 }
 
-function getPromptGenerationInstructions(mode: PromptMode) {
-  if (mode === "freeform") {
-    return [
-      "あなたは雑学ゲームと事実確認に強い編集者です。",
-      "友人同士で遊ぶ『自由律たほいや』のお題を1件だけ作ってください。",
-      "このモードでは、プレイヤーは正解ではない架空回答を考えます。",
-      "word には、明確な正解がある雑学・事実テーマまたは短い問いを入れてください。",
-      "correctDefinition には、その問いへの正しい答えを具体的に書いてください。",
-      "歴史、文化、科学、地理、芸術、生活史などから、意外だが確かめやすい事実を選んでください。",
-      "架空回答を作る余地がある題材にしてください。単なる二択、計算問題、最新ニュース、炎上しやすい政治・事件・差別的題材は避けてください。",
-      "正解は創作、推測、俗説ではなく、事実として扱える内容にしてください。",
-      "JSON以外は出力しないでください。",
-      '形式: {"word":"...","correctDefinition":"..."}',
-    ].join("\n");
-  }
-
-  return [
-    "あなたは日本語の辞書と語彙ゲームに詳しい編集者です。",
-    "友人同士で遊ぶ『たほいや』のお題を1件だけ選んでください。",
-    "造語は禁止です。必ず実在する日本語の難しい単語だけを選んでください。",
-    "お題として表示する語は、漢字表記ではなく読みだけをひらがなで返してください。",
-    "word にはひらがなの読みだけを入れてください。漢字、カタカナ、英数字、記号、括弧、送り仮名の注記は禁止です。",
-    "correctDefinition には、必要に応じて漢字表記を含めて、その読みの単語の正しい意味を書いてください。",
-    "意味は辞書的に正しい内容にしてください。推測、創作、俗説は禁止です。",
-    "一般的すぎる語、固有名詞、専門家でないと不快になりうる語、差別語、性的な語は避けてください。",
-    "プレイヤーが偽の意味を書きやすい、聞き慣れないが短めの語を優先してください。",
-    "JSON以外は出力しないでください。",
-    '形式: {"word":"...","correctDefinition":"..."}',
-  ].join("\n");
-}
-
-function getPromptGenerationInput(mode: PromptMode) {
-  return mode === "freeform"
-    ? "自由律たほいや向けのお題と正解を1件生成してください。"
-    : "たほいや向けのお題を1件生成してください。";
-}
-
 function getJsonSchema(mode: PromptMode) {
+  const prompt = getPromptGenerationPrompt(mode);
   return {
     type: "object",
     additionalProperties: false,
     properties: {
       word: {
         type: "string",
-        description: mode === "freeform"
-          ? "明確な正解がある雑学・事実テーマまたは短い問い"
-          : "実在する難しい日本語単語の読み。ひらがなのみ。",
+        description: prompt.schemaDescriptions.word,
       },
       correctDefinition: {
         type: "string",
-        description: mode === "freeform"
-          ? "そのテーマまたは問いへの正しい答え"
-          : "その単語の辞書的に正しい日本語の意味",
+        description: prompt.schemaDescriptions.correctDefinition,
       },
     },
     required: ["word", "correctDefinition"],
@@ -209,6 +171,7 @@ function extractOpenAiErrorMessage(errorBody: string) {
 }
 
 async function createGeneratedPrompt(openAiKey: string, mode: PromptMode) {
+  const prompt = getPromptGenerationPrompt(mode);
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -217,8 +180,8 @@ async function createGeneratedPrompt(openAiKey: string, mode: PromptMode) {
     },
     body: JSON.stringify({
       model: Deno.env.get("OPENAI_MODEL") ?? "gpt-5",
-      instructions: getPromptGenerationInstructions(mode),
-      input: getPromptGenerationInput(mode),
+      instructions: prompt.instructions.join("\n"),
+      input: prompt.input,
       text: {
         verbosity: "low",
         format: {

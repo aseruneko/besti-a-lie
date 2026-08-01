@@ -1,6 +1,6 @@
 {
   "tasks": {
-    "dev": "deno run -A --env-file --watch=static/,routes/,islands/ dev.ts",
+    "dev": "deno run -A --env-file --watch=static/,routes/,islands/,lib/,prompts/ dev.ts",
     "start": "deno run -A --env-file main.ts",
     "manifest": "deno run -A --env-file dev.ts --manifest",
     "build": "deno run -A dev.ts build",
